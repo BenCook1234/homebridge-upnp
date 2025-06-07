@@ -5,7 +5,9 @@ class MediaRenderer1 extends Device {
     constructor(platform, USN, accessory) {
         super(platform, USN, accessory);
 
+        this._isPlaying = false;
         this._handleEvent = this._handleEvent.bind(this);
+        this._handleAVTransportEvent = this._handleAVTransportEvent.bind(this);
     }
 
     _createAccessory(description) {
@@ -13,9 +15,7 @@ class MediaRenderer1 extends Device {
 
         if (!accessory) {
             let UUID = description.UDN.substr('uuid:'.length);
-
-            // Some UPnP devices provide not UUID v4, so make it compatible
-            if(!homebridge.hap.uuid.isValid(UUID)) {
+            if (!homebridge.hap.uuid.isValid(UUID)) {
                 UUID = homebridge.hap.uuid.generate(UUID);
             }
 
@@ -27,29 +27,49 @@ class MediaRenderer1 extends Device {
 
         this._updateAccessory(description);
 
-        let switchService = this.accessory.getService(homebridge.hap.Service.Lightbulb);
+        const { Service, Characteristic } = homebridge.hap;
 
-        if (!switchService) {
-            this.accessory.addService(homebridge.hap.Service.Lightbulb);
-            switchService = this.accessory.getService(homebridge.hap.Service.Lightbulb)
+        // === TV Service ===
+        let tvService = this.accessory.getServiceById(Service.Television, 'MediaTV');
+        if (!tvService) {
+            tvService = new Service.Television('Media Renderer', 'MediaTV');
+            this.accessory.addService(tvService);
         }
 
-        switchService.getCharacteristic(homebridge.hap.Characteristic.On)
+        tvService
+            .setCharacteristic(Characteristic.ConfiguredName, description.friendlyName || 'UPnP TV')
+            .setCharacteristic(Characteristic.SleepDiscoveryMode, Characteristic.SleepDiscoveryMode.ALWAYS_DISCOVERABLE);
+
+        tvService.getCharacteristic(Characteristic.Active)
             .on('get', (callback) => {
-                this._getMute((err, value) => {
-                    if (err) {
-                        callback(err);
-                        return;
-                    }
-
-                    callback(null, !value);
-                })
+                callback(null, this._isPlaying ? 1 : 0);
             })
-            .on('set', (value, callback) => this._setMute(!value, callback));
+            .on('set', (value, callback) => {
+                if (value === 1) {
+                    this._setPlay(callback);
+                } else {
+                    this._setPause(callback);
+                }
+            });
 
-        switchService.getCharacteristic(homebridge.hap.Characteristic.Brightness)
+        // === Speaker Service ===
+        let speakerService = this.accessory.getServiceById(Service.TelevisionSpeaker, 'Speaker');
+        if (!speakerService) {
+            speakerService = new Service.TelevisionSpeaker('Speaker', 'Speaker');
+            this.accessory.addService(speakerService);
+        }
+
+        speakerService
+            .setCharacteristic(Characteristic.Active, Characteristic.Active.ACTIVE)
+            .setCharacteristic(Characteristic.VolumeControlType, Characteristic.VolumeControlType.ABSOLUTE);
+
+        speakerService.getCharacteristic(Characteristic.Volume)
             .on('get', this._getVolume.bind(this))
             .on('set', this._setVolume.bind(this));
+
+        speakerService.getCharacteristic(Characteristic.Mute)
+            .on('get', (callback) => this._getMute((err, value) => callback(err, !!value)))
+            .on('set', (value, callback) => this._setMute(value, callback));
     }
 
     _updateAccessory(description) {
@@ -74,6 +94,7 @@ class MediaRenderer1 extends Device {
 
     onStart() {
         this._client.subscribe('RenderingControl', this._handleEvent);
+        this._client.subscribe('AVTransport', this._handleAVTransportEvent);
     }
 
     onAlive() {
@@ -82,8 +103,10 @@ class MediaRenderer1 extends Device {
                 this._platform.log.error(err);
                 return;
             }
-
-            this.accessory.getService(homebridge.hap.Service.Lightbulb).getCharacteristic(homebridge.hap.Characteristic.On).updateValue(!value);
+            const speakerService = this.accessory.getServiceById(homebridge.hap.Service.TelevisionSpeaker, 'Speaker');
+            if (speakerService) {
+                speakerService.getCharacteristic(homebridge.hap.Characteristic.Mute).updateValue(!!value);
+            }
         });
 
         this._getVolume((err, value) => {
@@ -91,37 +114,91 @@ class MediaRenderer1 extends Device {
                 this._platform.log.error(err);
                 return;
             }
+            const speakerService = this.accessory.getServiceById(homebridge.hap.Service.TelevisionSpeaker, 'Speaker');
+            if (speakerService) {
+                speakerService.getCharacteristic(homebridge.hap.Characteristic.Volume).updateValue(value);
+            }
+        });
 
-            this.accessory.getService(homebridge.hap.Service.Lightbulb).getCharacteristic(homebridge.hap.Characteristic.Brightness).updateValue(value);
+        this._client.callAction('AVTransport', 'GetTransportInfo', {
+            InstanceID: 0
+        }, (err, result) => {
+            if (!err && result.CurrentTransportState) {
+                this._handleAVTransportEvent({ TransportState: result.CurrentTransportState });
+            }
         });
     }
 
     onBye() {
-        this.accessory.getService(homebridge.hap.Service.Lightbulb).getCharacteristic(homebridge.hap.Characteristic.On).updateValue(false);
+        const tvService = this.accessory.getServiceById(homebridge.hap.Service.Television, 'MediaTV');
+        if (tvService) {
+            tvService.getCharacteristic(homebridge.hap.Characteristic.Active).updateValue(0);
+        }
     }
 
     stop() {
         if (this._client) {
             this._client.unsubscribe('RenderingControl', this._handleEvent);
+            this._client.unsubscribe('AVTransport', this._handleAVTransportEvent);
         }
     }
 
     _handleEvent(event) {
         if (event.Volume) {
             const volume = parseInt(event.Volume);
-
-            this.accessory.getService(homebridge.hap.Service.Lightbulb).getCharacteristic(homebridge.hap.Characteristic.Brightness).updateValue(volume);
+            const speakerService = this.accessory.getServiceById(homebridge.hap.Service.TelevisionSpeaker, 'Speaker');
+            if (speakerService) {
+                speakerService.getCharacteristic(homebridge.hap.Characteristic.Volume).updateValue(volume);
+            }
         }
 
         if (event.Mute) {
             const mute = Boolean(parseInt(event.Mute));
-
-            this.accessory.getService(homebridge.hap.Service.Lightbulb).getCharacteristic(homebridge.hap.Characteristic.On).updateValue(!mute);
+            const speakerService = this.accessory.getServiceById(homebridge.hap.Service.TelevisionSpeaker, 'Speaker');
+            if (speakerService) {
+                speakerService.getCharacteristic(homebridge.hap.Characteristic.Mute).updateValue(mute);
+            }
         }
     }
 
+    _handleAVTransportEvent(event) {
+        if (event.TransportState) {
+            const state = event.TransportState;
+            this._platform.log(`Playback state changed: ${state}`);
+
+            this._isPlaying = (state === 'PLAYING');
+
+            const tvService = this.accessory.getServiceById(homebridge.hap.Service.Television, 'MediaTV');
+            if (tvService) {
+                tvService.getCharacteristic(homebridge.hap.Characteristic.Active)
+                    .updateValue(this._isPlaying ? 1 : 0);
+            }
+        }
+    }
+
+    _setPlay(callback) {
+        if (!this._client) return callback(new Error('Client not initialized'));
+        this._client.callAction('AVTransport', 'Play', {
+            InstanceID: 0,
+            Speed: '1'
+        }, (err) => {
+            if (!err) this._isPlaying = true;
+            callback(err);
+        });
+    }
+
+    _setPause(callback) {
+        if (!this._client) return callback(new Error('Client not initialized'));
+        this._client.callAction('AVTransport', 'Pause', {
+            InstanceID: 0
+        }, (err) => {
+            if (!err) this._isPlaying = false;
+            callback(err);
+        });
+    }
+
     _getMute(callback) {
-        if (this._client === null) {
+        if (!this._client) {
             callback(new Error('Client not initialized'));
             return;
         }
@@ -140,7 +217,7 @@ class MediaRenderer1 extends Device {
     }
 
     _getVolume(callback) {
-        if (this._client === null) {
+        if (!this._client) {
             callback(new Error('Client not initialized'));
             return;
         }
@@ -159,7 +236,7 @@ class MediaRenderer1 extends Device {
     }
 
     _setMute(value, callback) {
-        if (this._client === null) {
+        if (!this._client) {
             callback(new Error('Client not initialized'));
             return;
         }
@@ -172,7 +249,7 @@ class MediaRenderer1 extends Device {
     }
 
     _setVolume(value, callback) {
-        if (this._client === null) {
+        if (!this._client) {
             callback(new Error('Client not initialized'));
             return;
         }
